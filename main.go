@@ -3,18 +3,22 @@
 //
 // The link below is the code from which this code originates:
 // https://github.com/tailscale/tailscale/blob/741ae9956e674177687062b5499a80db83505076/cmd/nginx-auth/nginx-auth.go
-
 package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
-
+	"sync"
+	
+	"github.com/fsnotify/fsnotify"
+	"gopkg.in/yaml.v3"
 	"tailscale.com/client/tailscale"
 )
 
@@ -23,14 +27,106 @@ var (
 	listenAddr       = flag.String("addr", "127.0.0.1:", "address to listen on, defaults to 127.0.0.1:")
 	headerRemoteIP   = flag.String("remote-ip-header", "X-Forwarded-For", "HTTP header field containing the remote IP")
 	headerRemotePort = flag.String("remote-port-header", "X-Forwarded-Port", "HTTP header field containing the remote port")
+	allowlistPath    = "/etc/allowlist.yaml" // Path to the allowlist file
 	debug            = flag.Bool("debug", false, "enable debug logging")
 )
+
+// AllowlistConfig represents the structure of the allowlist file
+type AllowlistConfig struct {
+	Allowlist map[string][]string `yaml:"allowlist"`
+}
+
+var (
+	allowlist = make(map[string][]string)
+	mu        sync.RWMutex
+)
+
+// LoadAllowlist dynamically loads the allowlist from the file
+func LoadAllowlist(filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open allowlist file: %w", err)
+	}
+	defer file.Close()
+
+	var config AllowlistConfig
+	decoder := yaml.NewDecoder(file)
+	if err := decoder.Decode(&config); err != nil {
+		return fmt.Errorf("failed to decode allowlist file: %w", err)
+	}
+
+	mu.Lock()
+	allowlist = config.Allowlist
+	mu.Unlock()
+	return nil
+}
+
+func watchAllowlist(filePath string) {
+    watcher, err := fsnotify.NewWatcher()
+    if err != nil {
+        log.Fatalf("Failed to create file watcher: %v", err)
+    }
+    defer watcher.Close()
+
+    err = watcher.Add(filePath)
+    if err != nil {
+        log.Fatalf("Failed to add file to watcher: %v", err)
+    }
+
+    for {
+        select {
+        case event, ok := <-watcher.Events:
+            if !ok {
+                return
+            }
+            if event.Op&fsnotify.Write == fsnotify.Write {
+                log.Printf("Allowlist file changed: %s", event.Name)
+                if err := LoadAllowlist(filePath); err != nil {
+                    log.Printf("Failed to reload allowlist: %v", err)
+                } else {
+                    log.Println("Allowlist reloaded successfully")
+                }
+            }
+        case err, ok := <-watcher.Errors:
+            if !ok {
+                return
+            }
+            log.Printf("Watcher error: %v", err)
+        }
+    }
+}
+
+
+// IsUserAllowed checks if a user is allowed access to a specific host
+func IsUserAllowed(host, user string) bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	allowedUsers, exists := allowlist[host]
+	if !exists {
+		return false
+	}
+	for _, allowedUser := range allowedUsers {
+		if user == allowedUser {
+			return true
+		}
+	}
+	return false
+}
 
 func main() {
 	flag.Parse()
 	if *listenAddr == "" {
 		log.Fatal("listen address not set")
 	}
+
+	// Initial loading of the allowlist
+	if err := LoadAllowlist(allowlistPath); err != nil {
+		log.Fatalf("Failed to load allowlist: %v", err)
+	}
+
+	 // Start watching the allowlist file for changes
+	 go watchAllowlist(allowlistPath)
+
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +157,11 @@ func main() {
 
 		client := &tailscale.LocalClient{}
 		info, err := client.WhoIs(r.Context(), remoteAddr.String())
+		// log.Printf("Node: %+v", info.Node)
+		// log.Printf("UserProfile: %+v", info.UserProfile)
+		// log.Printf("Capabilities: %+v", info.CapMap)
+		
+		
 		if err != nil {
 			w.WriteHeader(http.StatusUnauthorized)
 			log.Printf("can't look up %s: %v", remoteAddr, err)
@@ -91,6 +192,15 @@ func main() {
 		if expectedTailnet := r.Header.Get("Expected-Tailnet"); expectedTailnet != "" && expectedTailnet != tailnet {
 			w.WriteHeader(http.StatusForbidden)
 			log.Printf("user is part of tailnet %s, wanted: %s", tailnet, url.QueryEscape(expectedTailnet))
+			return
+		}
+
+		user := info.UserProfile.LoginName
+		host := r.Header.Get("X-Forwarded-Host")
+
+		if !IsUserAllowed(host, user) {
+			w.WriteHeader(http.StatusForbidden)
+			log.Printf("User %s is NOT allowed to access %s", user, host)
 			return
 		}
 
