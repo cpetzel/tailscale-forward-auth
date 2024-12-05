@@ -1,3 +1,13 @@
+
+# CRAIg
+on synology, to build, need to add go tou our path
+`export PATH=$PATH:/volume3/Data3/dev/go/go/bin`
+
+```shell
+$ docker build -t craig-tailscale-forward-auth:v1 .
+
+```
+
 # tailscale-forward-auth
 
 This is a basic example of how to implement a Tailscale authentication server

@@ -16,10 +16,13 @@ import (
 	"os"
 	"strings"
 	"sync"
-	
+
+	"context"
 	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/apitype"
+	"github.com/patrickmn/go-cache"
 )
 
 var (
@@ -31,6 +34,8 @@ var (
 	debug            = flag.Bool("debug", false, "enable debug logging")
 )
 
+var whoisCache = cache.New(-1, -1) // No expiration or cleanup
+
 // AllowlistConfig represents the structure of the allowlist file
 type AllowlistConfig struct {
 	Allowlist map[string][]string `yaml:"allowlist"`
@@ -40,6 +45,26 @@ var (
 	allowlist = make(map[string][]string)
 	mu        sync.RWMutex
 )
+
+func getWhoIsCached(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
+	// Check if the result is already in the cache
+	if result, found := whoisCache.Get(remoteAddr); found {
+		return result.(*apitype.WhoIsResponse), nil
+	}
+
+	// If not in cache, make the API call with context
+	client := &tailscale.LocalClient{}
+	info, err := client.WhoIs(ctx, remoteAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store the result in the cache indefinitely
+	whoisCache.Set(remoteAddr, info, cache.NoExpiration)
+	return info, nil
+}
+
+
 
 // LoadAllowlist dynamically loads the allowlist from the file
 func LoadAllowlist(filePath string) error {
@@ -155,8 +180,7 @@ func main() {
 			return
 		}
 
-		client := &tailscale.LocalClient{}
-		info, err := client.WhoIs(r.Context(), remoteAddr.String())
+		info, err := getWhoIsCached(r.Context(), remoteAddr.String())
 		// log.Printf("Node: %+v", info.Node)
 		// log.Printf("UserProfile: %+v", info.UserProfile)
 		// log.Printf("Capabilities: %+v", info.CapMap)
